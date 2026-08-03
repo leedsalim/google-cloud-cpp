@@ -17,11 +17,15 @@
 #include "google/cloud/storage/internal/async/handle_redirect_error.h"
 #include "google/cloud/storage/internal/async/multi_stream_manager.h"
 #include "google/cloud/storage/internal/async/object_descriptor_reader_tracing.h"
+#include "google/cloud/storage/internal/async/options.h"
+#include "google/cloud/storage/internal/async/read_range.h"
 #include "google/cloud/storage/internal/hash_function.h"
 #include "google/cloud/storage/internal/hash_function_impl.h"
 #include "google/cloud/grpc_error_delegate.h"
 #include "google/cloud/internal/opentelemetry.h"
 #include <google/rpc/status.pb.h>
+#include <algorithm>
+#include <limits>
 #include <memory>
 #include <utility>
 
@@ -43,6 +47,30 @@ ObjectDescriptorImpl::ObjectDescriptorImpl(
       []() -> std::shared_ptr<ReadStream> { return nullptr; },  // NOLINT
       std::make_shared<ReadStream>(std::move(stream),
                                    resume_policy_prototype_->clone()));
+  // If pre-warmed ranges are specified, initialize their `ReadRange` objects,
+  // register them as active on the initial stream, and cache them.
+  if (options_.has<ReadRangesOption>()) {
+    auto const& ranges = options_.get<ReadRangesOption>();
+    auto it = stream_manager_->GetFirstStream();
+    if (it != stream_manager_->End()) {
+      auto deduped_ranges = DeduplicateRanges(ranges);
+      for (auto const& dr : deduped_ranges) {
+        auto range_key = std::make_pair(dr.config.offset, dr.config.length);
+        auto range =
+            std::make_shared<ReadRange>(dr.config.offset, dr.config.length);
+        // Registering on the stream allows `OnRead` to route incoming data to
+        // these ranges.
+        it->active_ranges.emplace(dr.read_id, range);
+        // Cache them so subsequent `Read()` calls can claim them.
+        prewarmed_ranges_.emplace(range_key, PrewarmedRange{range, dr.read_id});
+      }
+      // Ensure new dynamically requested ranges use IDs that don't conflict
+      // with pre-warmed ones.
+      if (!deduped_ranges.empty()) {
+        read_id_generator_ = deduped_ranges.back().read_id;
+      }
+    }
+  }
 }
 
 ObjectDescriptorImpl::~ObjectDescriptorImpl() { Cancel(); }
@@ -148,6 +176,22 @@ std::unique_ptr<storage::AsyncReaderConnection> ObjectDescriptorImpl::Read(
   auto range = std::make_shared<ReadRange>(p.start, p.length, hash_function);
 
   std::unique_lock<std::mutex> lk(mu_);
+  // Check if this range matches a pre-warmed range.
+  auto cache_key = std::make_pair(p.start, p.length);
+  auto cache_it = prewarmed_ranges_.find(cache_key);
+  if (cache_it != prewarmed_ranges_.end()) {
+    // Cache hit. Claim the pre-warmed range and return it to the user.
+    auto prewarmed = std::move(cache_it->second);
+    prewarmed_ranges_.erase(cache_it);
+    lk.unlock();
+    if (!internal::TracingEnabled(options_)) {
+      return std::unique_ptr<storage::AsyncReaderConnection>(
+          std::make_unique<ObjectDescriptorReader>(std::move(prewarmed.range)));
+    }
+    return MakeTracingObjectDescriptorReader(std::move(prewarmed.range),
+                                             read_object_spec_.bucket());
+  }
+
   if (stream_manager_->Empty()) {
     lk.unlock();
     range->OnFinish(Status(StatusCode::kFailedPrecondition,
@@ -260,14 +304,22 @@ void ObjectDescriptorImpl::OnRead(
     auto const l = copy.find(id);
     if (l == copy.end()) continue;
 
+    auto range = l->second;
+    bool active = false;
+    lk.lock();
+    // Verify the range is still active on this stream. It might have been
+    // evicted or cancelled during the processing of this batch.
+    active = it->active_ranges.count(id) != 0;
+    lk.unlock();
+    if (active) {
 #if defined(GOOGLE_CLOUD_CPP_STORAGE_WITH_OTEL_METRICS) || \
     defined(GOOGLE_CLOUD_CPP_HAVE_OPENTELEMETRY)
-    l->second->SetT5(t5_stamp);
+      range->SetT5(t5_stamp);
 #endif
-
-    // TODO(#15104) - Consider returning if the range is done, and then
-    // skipping CleanupDoneRanges().
-    l->second->OnRead(std::move(range_data));
+      // TODO(#15104) - Consider returning if the range is done, and then
+      // skipping CleanupDoneRanges().
+      range->OnRead(std::move(range_data));
+    }
   }
   lk.lock();
   stream_manager_->CleanupDoneRanges(it);
