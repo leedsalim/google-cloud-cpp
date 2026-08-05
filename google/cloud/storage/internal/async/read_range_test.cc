@@ -591,7 +591,7 @@ TEST(ReadRange, NoResumeIfRequestExceeded) {
   EXPECT_FALSE(resume.has_value());
 }
 
-TEST(ReadRangeDeduplicationTest, Basic) {
+TEST(ReadRange, DeduplicateRangesBasic) {
   std::vector<ReadRangeConfig> ranges = {
       {0, 10},  {10, 10}, {0, 10},  // Duplicate
       {20, 10}, {10, 10},           // Duplicate
@@ -612,7 +612,7 @@ TEST(ReadRangeDeduplicationTest, Basic) {
   EXPECT_EQ(deduped[2].read_id, 3);
 }
 
-TEST(ReadRangeDeduplicationTest, InitialId) {
+TEST(ReadRange, DeduplicateRangesInitialId) {
   std::vector<ReadRangeConfig> ranges = {
       {0, 10},
   };
