@@ -47,7 +47,7 @@ TEST(ObjectDescriptorReaderTracing, Read) {
   auto span_catcher = InstallSpanCatcher();
 
   auto impl = std::make_shared<ReadRange>(10000, 30);
-  auto reader = MakeTracingObjectDescriptorReader(impl, "test-bucket");
+  auto reader = MakeTracingObjectDescriptorReader(impl, "test-bucket", "TEST");
 
   auto data = google::storage::v2::ObjectRangeData{};
   auto constexpr kData0 = R"pb(
@@ -63,6 +63,8 @@ TEST(ObjectDescriptorReaderTracing, Read) {
   EXPECT_THAT(
       spans, ElementsAre(
                  AllOf(SpanNamed("storage::AsyncConnection::ReadRange"),
+                       SpanHasAttributes(OTelAttribute<std::string>(
+                           "gl-cpp.initial-read-ranges.cache-status", "TEST")),
                        SpanHasEvents(AllOf(
                            EventNamed("gl-cpp.read-range"),
                            SpanEventAttributesAre(
@@ -75,7 +77,7 @@ TEST(ObjectDescriptorReaderTracing, Read) {
 TEST(ObjectDescriptorReaderTracing, ReadError) {
   auto span_catcher = InstallSpanCatcher();
   auto impl = std::make_shared<ReadRange>(10000, 30);
-  auto reader = MakeTracingObjectDescriptorReader(impl, "test-bucket");
+  auto reader = MakeTracingObjectDescriptorReader(impl, "test-bucket", "TEST");
 
   impl->OnFinish(PermanentError());
 
@@ -86,12 +88,50 @@ TEST(ObjectDescriptorReaderTracing, ReadError) {
       ElementsAre(AllOf(
           SpanNamed("storage::AsyncConnection::ReadRange"),
           SpanHasAttributes(
-              OTelAttribute<std::string>("gl-cpp.status_code", "NOT_FOUND")),
+              OTelAttribute<std::string>("gl-cpp.status_code", "NOT_FOUND"),
+              OTelAttribute<std::string>(
+                  "gl-cpp.initial-read-ranges.cache-status", "TEST")),
           SpanHasEvents(AllOf(EventNamed("gl-cpp.read-range"),
                               SpanEventAttributesAre(
                                   OTelAttribute<std::string>(sc::kThreadId, _),
                                   OTelAttribute<std::string>("rpc.message.type",
                                                              "RECEIVED")))))));
+}
+
+TEST(ObjectDescriptorReaderTracing, ReadWithoutInitialReadRanges) {
+  auto span_catcher = InstallSpanCatcher();
+  auto impl = std::make_shared<ReadRange>(10000, 30);
+  // Pass empty string for cache_status when initial read ranges were not
+  // configured.
+  auto reader = MakeTracingObjectDescriptorReader(impl, "test-bucket", "");
+
+  impl->OnFinish(PermanentError());
+
+  auto actual = reader->Read().get();
+  auto spans = span_catcher->GetSpans();
+  ASSERT_EQ(spans.size(), 1);
+  auto const& attributes = spans[0]->GetAttributes();
+  EXPECT_EQ(attributes.find("gl-cpp.initial-read-ranges.cache-status"),
+            attributes.end());
+}
+
+TEST(ObjectDescriptorReaderTracing, ReadWithCacheStatuses) {
+  for (auto const* status : {"HIT", "MISS", "EVICTED"}) {
+    auto span_catcher = InstallSpanCatcher();
+    auto impl = std::make_shared<ReadRange>(10000, 30);
+    auto reader =
+        MakeTracingObjectDescriptorReader(impl, "test-bucket", status);
+
+    impl->OnFinish(PermanentError());
+
+    auto actual = reader->Read().get();
+    auto spans = span_catcher->GetSpans();
+    EXPECT_THAT(spans,
+                ElementsAre(AllOf(
+                    SpanNamed("storage::AsyncConnection::ReadRange"),
+                    SpanHasAttributes(OTelAttribute<std::string>(
+                        "gl-cpp.initial-read-ranges.cache-status", status)))));
+  }
 }
 
 }  // namespace
