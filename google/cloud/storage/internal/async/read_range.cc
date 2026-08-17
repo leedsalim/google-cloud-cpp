@@ -82,6 +82,10 @@ void ReadRange::OnRead(google::storage::v2::ObjectRangeData data) {
   offset_ += content.size();
   if (length_ != 0) length_ -= std::min<std::int64_t>(content.size(), length_);
   auto p = ReadPayloadImpl::Make(std::move(content));
+#if defined(GOOGLE_CLOUD_CPP_STORAGE_WITH_OTEL_METRICS) || \
+    defined(GOOGLE_CLOUD_CPP_HAVE_OPENTELEMETRY)
+  ReadPayloadImpl::SetTimestamps(p, t4_, t5_, std::chrono::steady_clock::now());
+#endif
   if (wait_) {
     if (!payload_) return Notify(std::move(lk), std::move(p));
     GCP_LOG(FATAL) << "broken class invariant, `payload_` set when there is an"
