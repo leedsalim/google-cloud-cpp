@@ -15,6 +15,7 @@
 #ifdef GOOGLE_CLOUD_CPP_HAVE_OPENTELEMETRY
 
 #include "google/cloud/storage/internal/async/reader_connection_tracing.h"
+#include "google/cloud/storage/internal/async/read_payload_impl.h"
 #include "google/cloud/storage/mocks/mock_async_reader_connection.h"
 #include "google/cloud/storage/testing/canonical_errors.h"
 #include "google/cloud/internal/opentelemetry.h"
@@ -81,7 +82,7 @@ TEST(ReaderConnectionTracing, WithError) {
       .WillOnce(expect_context(p1))
       .WillOnce(expect_context(p2));
   auto actual = MakeTracingReaderConnection(
-      internal::MakeSpan("test-span-name"), std::move(mock));
+      internal::MakeSpan("test-span-name"), std::move(mock), "test-bucket");
 
   auto f1 = actual->Read().then(expect_no_context);
   p1.set_value(ReadResponse(ReadPayload("m1")));
@@ -139,7 +140,7 @@ TEST(ReaderConnectionTracing, WithSuccess) {
       .WillOnce(Return(RpcMetadata{{{"hk0", "v0"}, {"hk1", "v1"}},
                                    {{"tk0", "v0"}, {"tk1", "v1"}}}));
   auto actual = MakeTracingReaderConnection(
-      internal::MakeSpan("test-span-name"), std::move(mock));
+      internal::MakeSpan("test-span-name"), std::move(mock), "test-bucket");
 
   auto f1 = actual->Read().then(expect_no_context);
   p1.set_value(ReadResponse(ReadPayload("m1")));
@@ -195,6 +196,49 @@ TEST(ReaderConnectionTracing, WithSuccess) {
               UnorderedElementsAre(Pair("hk0", "v0"), Pair("hk1", "v1")));
   EXPECT_THAT(metadata.trailers,
               UnorderedElementsAre(Pair("tk0", "v0"), Pair("tk1", "v1")));
+}
+
+TEST(ReaderConnectionTracing, ReadLatencyEvent) {
+  auto span_catcher = InstallSpanCatcher();
+  PromiseWithOTelContext<ReadResponse> p1;
+  PromiseWithOTelContext<ReadResponse> p2;
+
+  auto mock = std::make_unique<MockAsyncReaderConnection>();
+  EXPECT_CALL(*mock, Read)
+      .WillOnce(expect_context(p1))
+      .WillOnce(expect_context(p2));
+  auto actual = MakeTracingReaderConnection(
+      internal::MakeSpan("test-span-name"), std::move(mock), "test-bucket");
+
+  auto f1 = actual->Read().then(expect_no_context);
+  auto now = std::chrono::steady_clock::now() - std::chrono::milliseconds(2);
+  auto payload = ReadPayload("m1");
+  ReadPayloadImpl::SetTimestamps(payload, now,
+                                 now + std::chrono::microseconds(100),
+                                 now + std::chrono::microseconds(300));
+  p1.set_value(ReadResponse(std::move(payload)));
+  (void)f1.get();
+
+  auto f2 = actual->Read().then(expect_no_context);
+  p2.set_value(ReadResponse(Status{}));
+  (void)f2.get();
+
+  auto spans = span_catcher->GetSpans();
+  using EventMatcher =
+      testing::Matcher<opentelemetry::sdk::trace::SpanDataEvent>;
+  EXPECT_THAT(
+      spans,
+      ElementsAre(AllOf(
+          SpanNamed("test-span-name"),
+          SpanHasEvents(
+              EventMatcher(EventNamed("gl-cpp.read")),
+              EventMatcher(AllOf(
+                  EventNamed("gl-cpp.latency.read"),
+                  SpanEventAttributesAre(
+                      OTelAttribute<double>("gl-cpp.latency.queue", 100.0),
+                      OTelAttribute<double>("gl-cpp.latency.network", 200.0),
+                      OTelAttribute<double>("gl-cpp.latency.internal",
+                                            _))))))));
 }
 
 }  // namespace
